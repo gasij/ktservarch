@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Общая библиотека контрактов событий. На неё ссылаются издатели и потребители. -->
+  <ItemGroup>
+    <PackageReference Include="MassTransit.Abstractions" />
+  </ItemGroup>
+
+</Project>

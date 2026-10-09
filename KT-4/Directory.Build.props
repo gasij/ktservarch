@@ -1,0 +1,11 @@
+<Project>
+  <!-- Общие настройки для всех проектов решения. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- XML-документация: summary-комментарии попадают в Swagger,
+         а компилятор предупреждает (CS1591) о публичных членах без комментариев. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+</Project>

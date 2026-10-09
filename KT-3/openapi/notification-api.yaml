@@ -1,0 +1,232 @@
+openapi: 3.0.3
+info:
+  title: ShopHub NotificationService API
+  version: 1.0.0
+  description: |
+    In-app уведомления, настройки каналов и журнал отправок для поддержки (КТ-3, раздел 2.3).
+    Основная работа сервиса — обработка событий RabbitMQ, она описана в документе (2.3.2, 2.4).
+    Портов наружу у сервиса нет: Gateway публикует только /api/notifications/* и /api/admin/notifications/*.
+servers:
+  - url: http://localhost:5000
+    description: Через API Gateway (docker-compose)
+  - url: http://localhost:5006
+    description: Напрямую, запуск из IDE
+tags:
+  - name: Notifications
+  - name: Admin
+
+paths:
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: Свои in-app уведомления, новые сверху
+      operationId: listMyNotifications
+      parameters:
+        - { name: unreadOnly, in: query, schema: { type: boolean, default: false } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses:
+        '200':
+          description: Страница уведомлений
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InAppNotificationList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/notifications/unread-count:
+    get:
+      tags: [Notifications]
+      summary: Количество непрочитанных
+      operationId: getUnreadCount
+      responses:
+        '200':
+          description: Счётчик
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer, example: 3 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/notifications/{id}/read:
+    post:
+      tags: [Notifications]
+      summary: Отметить уведомление прочитанным (идемпотентно)
+      operationId: markRead
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Отмечено }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Отметить все свои уведомления прочитанными
+      operationId: markAllRead
+      responses:
+        '204': { description: Отмечено }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/notifications/settings:
+    get:
+      tags: [Notifications]
+      summary: Настройки каналов
+      operationId: getSettings
+      responses:
+        '200':
+          description: Настройки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Settings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Notifications]
+      summary: Изменить настройки каналов
+      description: Транзакционные письма о заказе отправляются независимо от emailEnabled.
+      operationId: updateSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Settings' }
+      responses:
+        '200':
+          description: Новые настройки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Settings' }
+        '400':
+          description: VALIDATION_FAILED
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/admin/notifications:
+    get:
+      tags: [Admin]
+      summary: Журнал отправок (Admin)
+      operationId: listNotificationsAdmin
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/DeliveryStatus' } }
+        - { name: userId, in: query, schema: { type: string, format: uuid } }
+        - { name: type, in: query, schema: { type: string, example: OrderConfirmed } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Страница журнала
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminNotificationList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/notifications/{id}/retry:
+    post:
+      tags: [Admin]
+      summary: Повторить отправку уведомления в статусе Failed (Admin)
+      operationId: retryNotification
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '202': { description: Уведомление поставлено в очередь отправки (Pending) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: INVALID_STATUS_TRANSITION — уведомление не в статусе Failed
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    Unauthorized:
+      description: Нет токена, токен просрочен или подпись неверна
+    Forbidden:
+      description: FORBIDDEN
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: NOTIFICATION_NOT_FOUND
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      required: [title, status, code, traceId]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string }
+        detail: { type: string }
+        traceId: { type: string }
+    DeliveryStatus:
+      type: string
+      enum: [Pending, Sending, Sent, Failed, Skipped]
+    InAppNotification:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, example: OrderConfirmed }
+        title: { type: string, example: Заказ оплачен }
+        text: { type: string }
+        link: { type: string, example: /orders/0192a5d0-aaaa-7bbb-8ccc-000000000777 }
+        isRead: { type: boolean }
+        createdAt: { type: string, format: date-time }
+    InAppNotificationList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/InAppNotification' }
+        totalCount: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+    Settings:
+      type: object
+      required: [emailEnabled, smsEnabled]
+      properties:
+        emailEnabled: { type: boolean, example: true }
+        smsEnabled: { type: boolean, example: false }
+    AdminNotification:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        type: { type: string }
+        channel: { type: string, enum: [Email, Sms, InApp] }
+        recipient: { type: string, nullable: true, description: Маскированный email или телефон }
+        status: { $ref: '#/components/schemas/DeliveryStatus' }
+        attempts: { type: integer }
+        nextAttemptAt: { type: string, format: date-time, nullable: true }
+        lastError: { type: string, nullable: true }
+        correlationId: { type: string, format: uuid, nullable: true, description: orderId }
+        createdAt: { type: string, format: date-time }
+        sentAt: { type: string, format: date-time, nullable: true }
+    AdminNotificationList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AdminNotification' }
+        totalCount: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+
+security:
+  - bearerAuth: []

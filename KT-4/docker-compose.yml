@@ -1,0 +1,168 @@
+# ShopHub.Microservices — CatalogService, OrderService, NotificationService и их инфраструктура.
+#
+#   docker compose up -d --build
+#
+# docker-compose.override.yml подхватывается автоматически и добавляет dev-настройки
+# (Swagger, проброс портов баз данных наружу).
+# Переменные берутся из .env (шаблон — .env.example); без .env работают значения по умолчанию.
+
+name: shophub
+
+x-service-healthcheck: &service-healthcheck
+  test: ["CMD", "curl", "-fsS", "http://localhost:8080/health/live"]
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 20s
+
+x-postgres-healthcheck: &postgres-healthcheck
+  test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+
+services:
+  # ── Инфраструктура ────────────────────────────────────────────────────────
+
+  # Database per Service: у каждого сервиса свой экземпляр PostgreSQL.
+  catalog-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: catalog
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - catalog-db-data:/var/lib/postgresql/data
+    healthcheck: *postgres-healthcheck
+    restart: unless-stopped
+
+  order-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - order-db-data:/var/lib/postgresql/data
+    healthcheck: *postgres-healthcheck
+    restart: unless-stopped
+
+  notification-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: notifications
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - notification-db-data:/var/lib/postgresql/data
+    healthcheck: *postgres-healthcheck
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "${RABBITMQ_UI_PORT:-15672}:15672"   # веб-интерфейс RabbitMQ
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # SMTP-заглушка: принимает все письма и показывает их в веб-интерфейсе.
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "${MAILPIT_UI_PORT:-8025}:8025"      # веб-интерфейс с полученными письмами
+    restart: unless-stopped
+
+  # ── Микросервисы ──────────────────────────────────────────────────────────
+
+  catalog-service:
+    build:
+      context: .
+      dockerfile: CatalogService/Dockerfile
+    image: shophub/catalog-service:latest
+    environment:
+      ConnectionStrings__Default: Host=catalog-db;Port=5432;Database=catalog;Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+      ConnectionStrings__Redis: redis:6379,abortConnect=false,connectTimeout=2000
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__Username: ${RABBITMQ_USER:-guest}
+      RabbitMQ__Password: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "${CATALOG_PORT:-5002}:8080"
+    depends_on:
+      catalog-db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    healthcheck: *service-healthcheck
+    restart: unless-stopped
+
+  order-service:
+    build:
+      context: .
+      dockerfile: OrderService/Dockerfile
+    image: shophub/order-service:latest
+    environment:
+      ConnectionStrings__Default: Host=order-db;Port=5432;Database=orders;Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+      CatalogService__BaseUrl: http://catalog-service:8080/
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__Username: ${RABBITMQ_USER:-guest}
+      RabbitMQ__Password: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "${ORDER_PORT:-5004}:8080"
+    depends_on:
+      order-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      # Каталог нужен для работы, но не для старта: без него OrderService
+      # поднимается и честно отвечает 503 (retry + circuit breaker).
+      catalog-service: { condition: service_started }
+    healthcheck: *service-healthcheck
+    restart: unless-stopped
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: NotificationService/Dockerfile
+    image: shophub/notification-service:latest
+    environment:
+      ConnectionStrings__Default: Host=notification-db;Port=5432;Database=notifications;Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__Username: ${RABBITMQ_USER:-guest}
+      RabbitMQ__Password: ${RABBITMQ_PASSWORD:-guest}
+      Email__Provider: ${EMAIL_PROVIDER:-Smtp}
+      Smtp__Host: ${SMTP_HOST:-mailpit}
+      Smtp__Port: ${SMTP_PORT:-1025}
+      Smtp__From: ${SMTP_FROM:-noreply@shophub.local}
+      Smtp__Username: ${SMTP_USERNAME:-}
+      Smtp__Password: ${SMTP_PASSWORD:-}
+      Smtp__UseStartTls: ${SMTP_USE_STARTTLS:-false}
+    ports:
+      - "${NOTIFICATION_PORT:-5006}:8080"
+    depends_on:
+      notification-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      mailpit: { condition: service_started }
+    healthcheck: *service-healthcheck
+    restart: unless-stopped
+
+volumes:
+  catalog-db-data:
+  order-db-data:
+  notification-db-data:
+  rabbitmq-data:

@@ -1,0 +1,274 @@
+# ShopHub — локальное окружение для CatalogService, OrderService, NotificationService (КТ-3).
+# Запуск: cp .env.example .env && docker compose up -d --build
+# Снаружи доступен только API Gateway: http://localhost:5000
+# UI для разработки (только 127.0.0.1): RabbitMQ :15672, Mailpit :8025, Jaeger :16686
+
+# ── Общие фрагменты ───────────────────────────────────────────
+x-dotnet-healthcheck: &dotnet-healthcheck
+  # Образы aspnet:10.0-alpine содержат wget (BusyBox); liveness не зависит от БД
+  test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health/live > /dev/null || exit 1"]
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 20s
+
+x-postgres-healthcheck: &postgres-healthcheck
+  test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+  interval: 5s
+  timeout: 5s
+  retries: 10
+
+x-jwt-env: &jwt-env
+  Jwt__MetadataAddress: http://identity-service:8080/.well-known/openid-configuration
+  Jwt__Issuer: https://id.shophub.ru
+  Jwt__Audiences__0: shophub-api
+  Jwt__RequireHttpsMetadata: "false"          # только для dev: внутри compose нет TLS
+
+x-rabbit-env: &rabbit-env
+  RabbitMq__Host: rabbitmq
+  RabbitMq__Username: ${RABBITMQ_USER}
+  RabbitMq__Password: ${RABBITMQ_PASSWORD}
+
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+
+services:
+
+  # ── API Gateway (единственный публичный порт) ───────────────
+  api-gateway:
+    build:
+      context: ..
+      dockerfile: src/ApiGateway/Dockerfile
+    ports:
+      - "5000:8080"
+    environment:
+      <<: [*jwt-env, *otel-env]
+      ASPNETCORE_ENVIRONMENT: Development
+      OTEL_SERVICE_NAME: api-gateway
+      ReverseProxy__Clusters__identity__Destinations__d1__Address: http://identity-service:8080
+      ReverseProxy__Clusters__catalog__Destinations__d1__Address: http://catalog-service:8080
+      ReverseProxy__Clusters__order__Destinations__d1__Address: http://order-service:8080
+      ReverseProxy__Clusters__notification__Destinations__d1__Address: http://notification-service:8080
+      Cors__AllowedOrigins__0: http://localhost:3000
+    networks: [public, internal]
+    depends_on:
+      identity-service: { condition: service_healthy }
+      catalog-service: { condition: service_healthy }
+      order-service: { condition: service_healthy }
+      notification-service: { condition: service_healthy }
+    healthcheck: *dotnet-healthcheck
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M }
+
+  # ── IdentityService (вне КТ-3; нужен для JWT и client_credentials) ──
+  identity-service:
+    build:
+      context: ..
+      dockerfile: src/IdentityService/Dockerfile
+    environment:
+      <<: [*rabbit-env, *otel-env]
+      ASPNETCORE_ENVIRONMENT: Development
+      OTEL_SERVICE_NAME: identity-service
+      ConnectionStrings__IdentityDb: Host=identity-db;Database=identity;Username=identity_app;Password=${IDENTITY_DB_PASSWORD}
+      Jwt__Issuer: https://id.shophub.ru
+      Jwt__AccessTokenMinutes: "15"
+      Jwt__SigningKeyPath: /keys/signing.pem   # RSA-ключ создаётся при первом старте и живёт в томе
+      Clients__0__ClientId: order-service
+      Clients__0__Secret: ${ORDER_SERVICE_CLIENT_SECRET}
+      Clients__0__Scopes__0: catalog.internal
+      Clients__0__Audience: catalog-internal
+    volumes:
+      - identity-keys:/keys
+    networks: [internal]
+    depends_on:
+      identity-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    healthcheck: *dotnet-healthcheck
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  # ── CatalogService ──────────────────────────────────────────
+  catalog-service:
+    build:
+      context: ..
+      dockerfile: src/CatalogService/Dockerfile
+    environment:
+      <<: [*jwt-env, *rabbit-env, *otel-env]
+      ASPNETCORE_ENVIRONMENT: Development
+      OTEL_SERVICE_NAME: catalog-service
+      Jwt__Audiences__1: catalog-internal     # принимает service-токены OrderService
+      ConnectionStrings__CatalogDb: Host=catalog-db;Database=catalog;Username=catalog_app;Password=${CATALOG_DB_PASSWORD};Maximum Pool Size=20
+      ConnectionStrings__CatalogDbReadOnly: Host=catalog-db;Database=catalog;Username=catalog_app;Password=${CATALOG_DB_PASSWORD};Maximum Pool Size=20
+      Redis__ConnectionString: redis:6379,password=${REDIS_PASSWORD},abortConnect=false
+      Catalog__ReservationDefaultTtlSeconds: "1200"
+      Catalog__AllowedImageHost: cdn.shophub.ru
+    networks: [internal]
+    expose: ["8080"]
+    depends_on:
+      catalog-db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      identity-service: { condition: service_healthy }
+    healthcheck: *dotnet-healthcheck
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  # ── OrderService ────────────────────────────────────────────
+  order-service:
+    build:
+      context: ..
+      dockerfile: src/OrderService/Dockerfile
+    environment:
+      <<: [*jwt-env, *rabbit-env, *otel-env]
+      ASPNETCORE_ENVIRONMENT: Development
+      OTEL_SERVICE_NAME: order-service
+      ConnectionStrings__OrderDb: Host=order-db;Database=orders;Username=order_app;Password=${ORDER_DB_PASSWORD};Maximum Pool Size=20
+      Services__Catalog__BaseUrl: http://catalog-service:8080
+      ServiceAuth__TokenEndpoint: http://identity-service:8080/connect/token
+      ServiceAuth__ClientId: order-service
+      ServiceAuth__ClientSecret: ${ORDER_SERVICE_CLIENT_SECRET}
+      Pii__ActiveKeyId: k1
+      Pii__Keys__k1: ${ORDER_PII_KEY_K1}
+      Orders__PaymentTimeoutMinutes: "15"
+    networks: [internal]
+    expose: ["8080"]
+    depends_on:
+      order-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      identity-service: { condition: service_healthy }
+      # catalog-service намеренно не указан: Order стартует и без него (graceful degradation, 6.4)
+    healthcheck: *dotnet-healthcheck
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  # ── NotificationService (нет портов наружу, только очередь и внутренний API) ──
+  notification-service:
+    build:
+      context: ..
+      dockerfile: src/NotificationService/Dockerfile
+    environment:
+      <<: [*jwt-env, *rabbit-env, *otel-env]
+      ASPNETCORE_ENVIRONMENT: Development
+      OTEL_SERVICE_NAME: notification-service
+      ConnectionStrings__NotificationDb: Host=notification-db;Database=notifications;Username=notification_app;Password=${NOTIFICATION_DB_PASSWORD};Maximum Pool Size=20
+      Smtp__Host: mailpit
+      Smtp__Port: "1025"
+      Smtp__UseStartTls: "false"
+      Smtp__Username: ${SMTP_USER:-}
+      Smtp__Password: ${SMTP_PASSWORD:-}
+      Smtp__From: ShopHub <no-reply@shophub.ru>
+      Smtp__MaxPerSecond: "20"
+      Sms__Enabled: "false"
+    networks: [internal]
+    expose: ["8080"]
+    depends_on:
+      notification-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      identity-service: { condition: service_healthy }
+      mailpit: { condition: service_started }
+    healthcheck: *dotnet-healthcheck
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  # ── Базы данных: отдельный инстанс на сервис (Database per Service) ──
+  # В dev POSTGRES_USER — владелец БД. В prod: роли *_app (DML) и *_migrator (DDL), см. 4.6.
+  identity-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: identity
+      POSTGRES_USER: identity_app
+      POSTGRES_PASSWORD: ${IDENTITY_DB_PASSWORD}
+    volumes: [identity-db-data:/var/lib/postgresql/data]
+    networks: [internal]
+    healthcheck: *postgres-healthcheck
+
+  catalog-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: catalog
+      POSTGRES_USER: catalog_app
+      POSTGRES_PASSWORD: ${CATALOG_DB_PASSWORD}
+    volumes: [catalog-db-data:/var/lib/postgresql/data]
+    networks: [internal]
+    healthcheck: *postgres-healthcheck
+
+  order-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: order_app
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD}
+    volumes: [order-db-data:/var/lib/postgresql/data]
+    networks: [internal]
+    healthcheck: *postgres-healthcheck
+
+  notification-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: notifications
+      POSTGRES_USER: notification_app
+      POSTGRES_PASSWORD: ${NOTIFICATION_DB_PASSWORD}
+    volumes: [notification-db-data:/var/lib/postgresql/data]
+    networks: [internal]
+    healthcheck: *postgres-healthcheck
+
+  # ── Redis: только кэш, без persistence ─────────────────────
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--save", "", "--appendonly", "no",
+              "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── RabbitMQ ────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: shophub
+    ports:
+      - "127.0.0.1:15672:15672"   # Management UI — только dev и только localhost
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Инструменты разработки ──────────────────────────────────
+  mailpit:                         # SMTP-ловушка: письма не уходят наружу, видны в UI
+    image: axllent/mailpit:latest  # в команде зафиксировать конкретную версию
+    ports:
+      - "127.0.0.1:8025:8025"
+    networks: [internal]
+
+  jaeger:                          # приём OTLP (4317) и UI трейсов
+    image: jaegertracing/jaeger:latest
+    ports:
+      - "127.0.0.1:16686:16686"
+    networks: [internal]
+
+networks:
+  public:     # смотрит наружу: только API Gateway
+  internal:   # сервисы, БД, брокер общаются только здесь
+
+volumes:
+  identity-keys:
+  identity-db-data:
+  catalog-db-data:
+  order-db-data:
+  notification-db-data:
+  rabbitmq-data:

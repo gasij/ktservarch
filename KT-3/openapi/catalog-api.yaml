@@ -1,0 +1,617 @@
+openapi: 3.0.3
+info:
+  title: ShopHub CatalogService API
+  version: 1.0.0
+  description: |
+    Товары, категории, остатки и резервы ShopHub (КТ-3, раздел 2.1).
+    Публичные маршруты `/api/catalog/*` доступны через API Gateway.
+    Маршруты `/internal/*` не публикуются через Gateway и требуют service-токен
+    с ролью `Service` и `scope=catalog.internal`.
+    Все ошибки возвращаются в формате Problem Details (RFC 9457) с полями `code` и `traceId`.
+servers:
+  - url: http://localhost:5000
+    description: Через API Gateway (docker-compose)
+  - url: http://localhost:5002
+    description: Напрямую, запуск из IDE
+tags:
+  - name: Products
+  - name: Stock
+  - name: Categories
+  - name: Internal
+    description: Только для OrderService (service JWT)
+
+paths:
+  /api/catalog/products:
+    get:
+      tags: [Products]
+      summary: Список активных товаров с фильтрами
+      operationId: listProducts
+      security: []
+      parameters:
+        - { name: categoryId, in: query, schema: { type: string, format: uuid }, description: Включая подкатегории }
+        - { name: sellerId, in: query, schema: { type: string, format: uuid } }
+        - { name: minPrice, in: query, schema: { type: number, format: decimal, minimum: 0 } }
+        - { name: maxPrice, in: query, schema: { type: number, format: decimal, minimum: 0 } }
+        - { name: inStock, in: query, schema: { type: boolean } }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [newest, price_asc, price_desc, rating], default: newest }
+        - $ref: '#/components/parameters/Page'
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+          description: page × pageSize ≤ 10000
+      responses:
+        '200':
+          description: Страница товаров
+          headers:
+            Cache-Control: { schema: { type: string, example: 'public, max-age=60' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductListResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+    post:
+      tags: [Products]
+      summary: Создать товар (Seller, Admin)
+      operationId: createProduct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProductRequest' }
+      responses:
+        '201':
+          description: Товар создан
+          headers:
+            Location: { schema: { type: string, example: /api/catalog/products/0192a5c4-7b1e-7c3a-9f10-3e5d2c1b0a01 } }
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductDetails' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/catalog/products/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Products]
+      summary: Карточка товара
+      description: Неактивный товар видят только Admin и владелец, остальным отдаётся 404.
+      operationId: getProduct
+      security: [{}, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: Карточка товара
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductDetails' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Products]
+      summary: Полное обновление товара (Admin или Seller-владелец)
+      operationId: updateProduct
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          schema: { type: string, example: '"817263"' }
+          description: ETag, полученный из GET
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProductRequest' }
+      responses:
+        '200':
+          description: Обновлённый товар
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductDetails' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/Problem' }
+        '428': { $ref: '#/components/responses/Problem' }
+    delete:
+      tags: [Products]
+      summary: Снять товар с продажи (мягкое удаление)
+      operationId: deleteProduct
+      responses:
+        '204': { description: Товар снят с продажи (повторный вызов тоже 204) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/catalog/products/by-slug/{slug}:
+    get:
+      tags: [Products]
+      summary: Карточка товара по slug
+      operationId: getProductBySlug
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-z0-9]+(-[a-z0-9]+)*$', maxLength: 220 }
+      responses:
+        '200':
+          description: Карточка товара
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductDetails' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/catalog/products/{id}/stock:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Stock]
+      summary: Остатки товара (Admin или Seller-владелец)
+      operationId: getStock
+      responses:
+        '200':
+          description: Остатки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stock' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Stock]
+      summary: Установить количество на складе
+      operationId: setStock
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [onHand]
+              properties:
+                onHand: { type: integer, minimum: 0, maximum: 1000000, example: 120 }
+      responses:
+        '200':
+          description: Новые остатки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stock' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: STOCK_BELOW_RESERVED — новый остаток меньше зарезервированного
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /api/catalog/categories:
+    get:
+      tags: [Categories]
+      summary: Дерево категорий
+      operationId: getCategoryTree
+      security: []
+      responses:
+        '200':
+          description: Дерево категорий
+          headers:
+            Cache-Control: { schema: { type: string, example: 'public, max-age=300' } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CategoryNode' }
+    post:
+      tags: [Categories]
+      summary: Создать категорию (Admin)
+      operationId: createCategory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CategoryRequest' }
+      responses:
+        '201':
+          description: Категория создана
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/catalog/categories/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    put:
+      tags: [Categories]
+      summary: Изменить категорию (Admin)
+      operationId: updateCategory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CategoryRequest' }
+      responses:
+        '200':
+          description: Изменённая категория
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Categories]
+      summary: Удалить пустую категорию (Admin)
+      operationId: deleteCategory
+      responses:
+        '204': { description: Категория удалена }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: CATEGORY_NOT_EMPTY — есть товары или подкатегории
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /internal/catalog/products/batch:
+    post:
+      tags: [Internal]
+      summary: Актуальные данные товаров для фиксации цены (без кэша)
+      operationId: getProductsBatch
+      security: [{ serviceAuth: [catalog.internal] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  uniqueItems: true
+                  items: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Найденные товары (включая неактивные) и список ненайденных id
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductBatchResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/inventory/reservations:
+    post:
+      tags: [Internal]
+      summary: Атомарно зарезервировать остатки под заказ (идемпотентно по orderId)
+      operationId: createReservation
+      security: [{ serviceAuth: [catalog.internal] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationRequest' }
+      responses:
+        '201':
+          description: Резерв создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+        '200':
+          description: Резерв с таким orderId уже существует (идемпотентный повтор)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: OUT_OF_STOCK или PRODUCT_UNAVAILABLE
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/OutOfStockProblem' }
+
+  /internal/inventory/reservations/{orderId}:
+    delete:
+      tags: [Internal]
+      summary: Снять активный резерв заказа (компенсация, идемпотентно)
+      operationId: releaseReservation
+      security: [{ serviceAuth: [catalog.internal] }]
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Резерв снят или его не было }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token пользователя (RS256, 15 минут), aud=shophub-api
+    serviceAuth:
+      type: oauth2
+      description: Service JWT, client credentials, aud=catalog-internal
+      flows:
+        clientCredentials:
+          tokenUrl: http://identity-service:8080/connect/token
+          scopes:
+            catalog.internal: Чтение товаров и резервы для OrderService
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+
+  headers:
+    ETag:
+      description: Версия ресурса для If-Match
+      schema: { type: string, example: '"817263"' }
+
+  responses:
+    ValidationFailed:
+      description: VALIDATION_FAILED
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ValidationProblem' }
+    Unauthorized:
+      description: Нет токена, токен просрочен или подпись неверна
+      headers:
+        WWW-Authenticate: { schema: { type: string, example: Bearer } }
+    Forbidden:
+      description: FORBIDDEN — недостаточно прав
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: PRODUCT_NOT_FOUND или CATEGORY_NOT_FOUND
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: SLUG_TAKEN и другие конфликты
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Problem:
+      description: Ошибка в формате Problem Details
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      required: [title, status, code, traceId]
+      properties:
+        type: { type: string, example: 'https://docs.shophub.ru/errors/forbidden' }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, example: FORBIDDEN }
+        detail: { type: string }
+        traceId: { type: string }
+    ValidationProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            errors:
+              type: object
+              additionalProperties:
+                type: array
+                items: { type: string }
+              example: { price: ['Цена должна быть больше 0'] }
+    OutOfStockProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  productId: { type: string, format: uuid }
+                  requested: { type: integer }
+                  available: { type: integer }
+
+    Money:
+      type: number
+      format: decimal
+      minimum: 0.01
+      maximum: 99999999.99
+      multipleOf: 0.01
+      example: 109990.00
+    CategoryRef:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Смартфоны }
+        slug: { type: string, example: smartfony }
+    Rating:
+      type: object
+      nullable: true
+      properties:
+        average: { type: number, example: 4.8 }
+        count: { type: integer, example: 312 }
+    ProductSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        price: { $ref: '#/components/schemas/Money' }
+        currency: { type: string, example: RUB }
+        category: { $ref: '#/components/schemas/CategoryRef' }
+        mainImageUrl: { type: string, format: uri, nullable: true }
+        inStock: { type: boolean }
+        rating: { $ref: '#/components/schemas/Rating' }
+    ProductListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ProductSummary' }
+        totalCount: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+    ProductDetails:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        description: { type: string }
+        price: { $ref: '#/components/schemas/Money' }
+        currency: { type: string, example: RUB }
+        category: { $ref: '#/components/schemas/CategoryRef' }
+        images:
+          type: array
+          items:
+            type: object
+            properties:
+              url: { type: string, format: uri }
+              sortOrder: { type: integer }
+        sellerId: { type: string, format: uuid }
+        inStock: { type: boolean }
+        rating: { $ref: '#/components/schemas/Rating' }
+        isActive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    UpdateProductRequest:
+      type: object
+      required: [name, description, price, categoryId, images]
+      properties:
+        name: { type: string, minLength: 3, maxLength: 200, example: iPhone 15 Pro 256 ГБ }
+        slug: { type: string, pattern: '^[a-z0-9]+(-[a-z0-9]+)*$', maxLength: 220 }
+        description: { type: string, maxLength: 20000 }
+        price: { $ref: '#/components/schemas/Money' }
+        categoryId: { type: string, format: uuid }
+        images:
+          type: array
+          maxItems: 10
+          items: { type: string, format: uri, pattern: '^https://cdn\.shophub\.ru/' }
+    CreateProductRequest:
+      allOf:
+        - $ref: '#/components/schemas/UpdateProductRequest'
+        - type: object
+          required: [initialStock]
+          properties:
+            initialStock: { type: integer, minimum: 0, maximum: 1000000, example: 15 }
+            sellerId:
+              type: string
+              format: uuid
+              nullable: true
+              description: Обязателен для Admin, игнорируется для Seller (берётся sub из JWT)
+    Stock:
+      type: object
+      properties:
+        productId: { type: string, format: uuid }
+        onHand: { type: integer }
+        reserved: { type: integer }
+        available: { type: integer }
+    Category:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        parentId: { type: string, format: uuid, nullable: true }
+        name: { type: string }
+        slug: { type: string }
+        sortOrder: { type: integer }
+    CategoryNode:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/CategoryNode' }
+    CategoryRequest:
+      type: object
+      required: [name, slug]
+      properties:
+        name: { type: string, minLength: 2, maxLength: 100 }
+        slug: { type: string, pattern: '^[a-z0-9]+(-[a-z0-9]+)*$', maxLength: 100 }
+        parentId: { type: string, format: uuid, nullable: true }
+        sortOrder: { type: integer, default: 0 }
+    ProductBatchResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              name: { type: string }
+              price: { $ref: '#/components/schemas/Money' }
+              currency: { type: string }
+              isActive: { type: boolean }
+              available: { type: integer }
+        notFound:
+          type: array
+          items: { type: string, format: uuid }
+    ReservationRequest:
+      type: object
+      required: [orderId, items]
+      properties:
+        orderId: { type: string, format: uuid }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            required: [productId, quantity]
+            properties:
+              productId: { type: string, format: uuid }
+              quantity: { type: integer, minimum: 1, maximum: 99 }
+        ttlSeconds: { type: integer, minimum: 60, maximum: 3600, default: 1200 }
+    Reservation:
+      type: object
+      properties:
+        orderId: { type: string, format: uuid }
+        status: { type: string, enum: [Active, Committed, Released, Returned] }
+        expiresAt: { type: string, format: date-time }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              productId: { type: string, format: uuid }
+              quantity: { type: integer }
+
+security:
+  - bearerAuth: []

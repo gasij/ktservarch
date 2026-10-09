@@ -1,0 +1,40 @@
+# Dev-настройки. Docker Compose применяет этот файл автоматически поверх docker-compose.yml.
+# Для «боевого» запуска без него: docker compose -f docker-compose.yml up -d
+
+services:
+  catalog-service:
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development   # включает Swagger UI
+
+  order-service:
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+
+  notification-service:
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+
+  # Порты баз и Redis наружу — чтобы подключаться из IDE/pgAdmin и запускать сервисы через dotnet run.
+  catalog-db:
+    ports:
+      - "5433:5432"
+
+  order-db:
+    ports:
+      - "5434:5432"
+
+  notification-db:
+    ports:
+      - "5435:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    ports:
+      - "5672:5672"
+
+  mailpit:
+    ports:
+      - "1025:1025"

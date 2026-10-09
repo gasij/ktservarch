@@ -1,0 +1,353 @@
+openapi: 3.0.3
+info:
+  title: ShopHub OrderService API
+  version: 1.0.0
+  description: |
+    Оформление заказов и их жизненный цикл (КТ-3, раздел 2.2).
+    Все маршруты требуют JWT пользователя. Чужой заказ возвращает 404, а не 403 (ADR-007).
+    Ошибки — Problem Details (RFC 9457) с полями `code` и `traceId`.
+servers:
+  - url: http://localhost:5000
+    description: Через API Gateway (docker-compose)
+  - url: http://localhost:5004
+    description: Напрямую, запуск из IDE
+tags:
+  - name: Orders
+
+paths:
+  /api/orders:
+    post:
+      tags: [Orders]
+      summary: Оформить заказ
+      description: |
+        Сервер сам берёт цены из CatalogService и резервирует остатки.
+        Повтор с тем же Idempotency-Key и тем же телом вернёт 200 с исходным заказом.
+      operationId: createOrder
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrderRequest' }
+      responses:
+        '201':
+          description: Заказ создан, ожидает оплаты
+          headers:
+            Location: { schema: { type: string, example: /api/orders/0192a5d0-aaaa-7bbb-8ccc-000000000777 } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '200':
+          description: Идемпотентный повтор — возвращён ранее созданный заказ
+          headers:
+            Idempotent-Replayed: { schema: { type: string, enum: ['true'] } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400':
+          description: VALIDATION_FAILED или IDEMPOTENCY_KEY_REQUIRED
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ValidationProblem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409':
+          description: OUT_OF_STOCK или PRODUCT_UNAVAILABLE
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/OutOfStockProblem' }
+        '422':
+          description: IDEMPOTENCY_KEY_REUSED — тот же ключ с другим телом
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: DEPENDENCY_UNAVAILABLE — CatalogService недоступен, заказ не создан
+          headers:
+            Retry-After: { schema: { type: integer, example: 15 } }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    get:
+      tags: [Orders]
+      summary: Список заказов (Customer — свои, Admin — все)
+      operationId: listOrders
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/OrderStatus' } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: userId, in: query, schema: { type: string, format: uuid }, description: Только для Admin }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses:
+        '200':
+          description: Страница заказов, новые сверху
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderListResponse' }
+        '400':
+          description: VALIDATION_FAILED
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ValidationProblem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Заказ целиком (владелец или Admin)
+      operationId: getOrder
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Заказ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/orders/{id}/history:
+    get:
+      tags: [Orders]
+      summary: История статусов заказа
+      operationId: getOrderHistory
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Записи истории по возрастанию времени
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/StatusHistoryEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/orders/{id}/cancel:
+    post:
+      tags: [Orders]
+      summary: Отменить заказ
+      description: Владелец — только в статусе AwaitingPayment. Admin — AwaitingPayment и Paid (тогда будет возврат денег).
+      operationId: cancelOrder
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500, example: Передумал }
+      responses:
+        '200':
+          description: Заказ отменён
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /api/orders/{id}/status:
+    patch:
+      tags: [Orders]
+      summary: Отметить отгрузку или доставку (Admin)
+      operationId: changeOrderStatus
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [Shipped, Delivered] }
+                comment: { type: string, maxLength: 500, example: 'СДЭК, трек 1234567890' }
+      responses:
+        '200':
+          description: Заказ в новом статусе
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400':
+          description: VALIDATION_FAILED
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ValidationProblem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: Нет токена, токен просрочен или подпись неверна
+      headers:
+        WWW-Authenticate: { schema: { type: string, example: Bearer } }
+    NotFound:
+      description: ORDER_NOT_FOUND — заказа нет или он чужой
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    InvalidTransition:
+      description: INVALID_STATUS_TRANSITION
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Problem:
+      description: Ошибка в формате Problem Details
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      required: [title, status, code, traceId]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, example: ORDER_NOT_FOUND }
+        detail: { type: string }
+        traceId: { type: string }
+    ValidationProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            errors:
+              type: object
+              additionalProperties:
+                type: array
+                items: { type: string }
+    OutOfStockProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  productId: { type: string, format: uuid }
+                  requested: { type: integer }
+                  available: { type: integer }
+
+    OrderStatus:
+      type: string
+      enum: [AwaitingPayment, Paid, Shipped, Delivered, Cancelled, Refunded]
+    Money:
+      type: number
+      format: decimal
+      multipleOf: 0.01
+      example: 219980.00
+    ShippingAddress:
+      type: object
+      required: [recipientName, phone, city, street, building, zipCode]
+      properties:
+        recipientName: { type: string, minLength: 2, maxLength: 100, example: Иван Петров }
+        phone: { type: string, pattern: '^\+7\d{10}$', example: '+79161234567' }
+        city: { type: string, minLength: 2, maxLength: 100, example: Москва }
+        street: { type: string, minLength: 2, maxLength: 200, example: ул. Пушкина }
+        building: { type: string, minLength: 1, maxLength: 20, example: '10' }
+        apartment: { type: string, maxLength: 20, nullable: true, example: '15' }
+        zipCode: { type: string, pattern: '^\d{6}$', example: '101000' }
+    CreateOrderRequest:
+      type: object
+      required: [items, shippingAddress]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: productId не должны повторяться
+          items:
+            type: object
+            required: [productId, quantity]
+            properties:
+              productId: { type: string, format: uuid }
+              quantity: { type: integer, minimum: 1, maximum: 99, example: 2 }
+        shippingAddress: { $ref: '#/components/schemas/ShippingAddress' }
+        comment: { type: string, maxLength: 500, nullable: true }
+    OrderItem:
+      type: object
+      properties:
+        productId: { type: string, format: uuid }
+        productName: { type: string, example: iPhone 15 Pro 256 ГБ }
+        unitPrice: { $ref: '#/components/schemas/Money' }
+        quantity: { type: integer }
+        lineTotal: { $ref: '#/components/schemas/Money' }
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        totalAmount: { $ref: '#/components/schemas/Money' }
+        currency: { type: string, example: RUB }
+        paymentDeadline: { type: string, format: date-time }
+        cancelReason:
+          type: string
+          nullable: true
+          enum: [PaymentFailed, PaymentTimeout, CancelledByCustomer, CancelledByAdmin, null]
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderItem' }
+        shippingAddress: { $ref: '#/components/schemas/ShippingAddress' }
+        comment: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    OrderSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        totalAmount: { $ref: '#/components/schemas/Money' }
+        currency: { type: string }
+        itemsCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+    OrderListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderSummary' }
+        totalCount: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+    StatusHistoryEntry:
+      type: object
+      properties:
+        fromStatus:
+          type: string
+          nullable: true
+          description: null для первой записи истории
+          enum: [AwaitingPayment, Paid, Shipped, Delivered, Cancelled, Refunded, null]
+        toStatus: { $ref: '#/components/schemas/OrderStatus' }
+        reason: { type: string, nullable: true }
+        changedBy: { type: string, example: system, description: 'Для владельца: user | admin | system. Для Admin: полное значение' }
+        changedAt: { type: string, format: date-time }
+
+security:
+  - bearerAuth: []
